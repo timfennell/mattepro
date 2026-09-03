@@ -7,8 +7,8 @@ clean, background-free stacks for photogrammetry / 3D Gaussian Splatting.
 
 ## What it does
 
-Each frame is shot twice — once against a black backdrop, once against white.
-Triangulation matting recovers a true alpha channel from that pair, including
+Each frame is shot three times — once against a black backdrop, once against white, and once on grey.
+Triangulation matting recovers a true alpha channel from that set, including
 genuine translucency such as insect wings, which a chroma key cannot.
 
 1. **Matte** — RAW black/white pairs to 16-bit RGBA TIFFs, with optional
