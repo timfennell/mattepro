@@ -1,0 +1,21 @@
+# PyInstaller
+build/
+dist/
+*.app/
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# macOS
+.DS_Store
+._*
+
+# Test media / captures
+*.ARW
+*.CR3
+*.NEF
+*.tif
+*.tiff
