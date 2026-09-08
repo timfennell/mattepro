@@ -1,0 +1,24 @@
+# MattePro runtime dependencies.
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+
+# Alpha-aware focus stacking. 1.17.0 is the first release that carries an
+# alpha channel through the Laplacian pyramid; older versions stack fine but
+# silently discard the matte, which looks like a MattePro bug rather than a
+# version problem. MattePro checks this at startup and says so in the UI.
+shinestacker>=1.17.0
+
+nicegui>=3.0            # browser UI
+numpy>=2.0
+tifffile>=2025.1.1      # 16-bit RGBA TIFF read/write
+Pillow>=11.0
+scipy>=1.14             # used by shinestacker's algorithms
+
+# tifffile resolves these at runtime rather than importing them up front,
+# so they are easy to miss until a file fails to open.
+imagecodecs>=2025.1.1
+psdtags>=2025.1.1
+
+# Building the .app bundle only:
+#   pyinstaller MattePro.spec
+# pyinstaller>=6.0

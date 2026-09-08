@@ -1,24 +1,42 @@
 # -*- mode: python ; coding: utf-8 -*-
+#
+# Build:  pyinstaller MattePro.spec        (from this directory, in the venv)
+#
+import os
+from PyInstaller.utils.hooks import copy_metadata
 
+# NiceGUI ships templates, JS and CSS beside its Python, and reads them from
+# disk at runtime, so the whole package is copied in as data rather than being
+# left to the module graph. Located via import instead of a hardcoded venv path
+# so the spec survives a Python upgrade or a different machine.
+import nicegui
+_nicegui_dir = os.path.dirname(nicegui.__file__)
+
+datas = [(_nicegui_dir, 'nicegui')]
+
+# MattePro reads shinestacker's version through importlib.metadata to warn when
+# it is too old to carry alpha (see _shinestacker_status). Dist metadata is not
+# bundled by default, and without it that check cannot report a version.
+datas += copy_metadata('shinestacker')
 
 a = Analysis(
     ['timelapse_matte_ng.py'],
     pathex=[],
     binaries=[],
-    datas=[('/Users/timothyfennell/Documents/paintbot/venv/lib/python3.14/site-packages/nicegui', 'nicegui')],
-    # shinestacker is loaded at RUNTIME from ~/Documents/shinestacker-alpha/src
-    # (see SHINESTACKER_SRC), so PyInstaller cannot statically trace its imports
-    # and will not bundle its dependencies. They must be declared explicitly or
-    # stacking fails in the frozen app with "No module named ...". Determined by
-    # tracing sys.modules across `from shinestacker import PyramidAutoStack`.
+    datas=datas,
+    # shinestacker is now an ordinary installed dependency
+    # (pip install "shinestacker>=1.17.0"), so PyInstaller traces
+    # `from shinestacker import PyramidAutoStack` itself and pulls in the bulk
+    # of the tree — including matplotlib, which shinestacker imports
+    # unconditionally at module scope.
+    #
+    # Only genuinely dynamic imports need declaring here: these are reached
+    # through lazy or plugin-style loading that static analysis cannot see.
     hiddenimports=[
-        'jsonpickle',    # shinestacker/config/settings.py
-        'psdtags',       # shinestacker/algorithms/multilayer.py
-        'scipy',         # shinestacker algorithms
+        'psdtags',        # shinestacker/algorithms/multilayer.py, loaded on demand
+        'imagecodecs',    # tifffile compression backend, resolved at runtime
         'scipy.ndimage',
         'scipy.signal',
-        'tqdm',          # shinestacker/core/{logging,core_utils}.py
-        'imagecodecs',   # shinestacker/algorithms/multilayer.py
     ],
     hookspath=[],
     hooksconfig={},
@@ -45,7 +63,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['/Users/timothyfennell/Documents/tilt correction/MattePro.icns'],
+    icon=['MattePro.icns'],
 )
 coll = COLLECT(
     exe,
@@ -59,6 +77,6 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='MattePro.app',
-    icon='/Users/timothyfennell/Documents/tilt correction/MattePro.icns',
+    icon='MattePro.icns',
     bundle_identifier='com.pislider.mattepro',
 )

@@ -26,7 +26,53 @@ from PIL import Image, ImageFilter
 
 from nicegui import ui, app
 
-SHINESTACKER_SRC = Path.home() / "Documents" / "shinestacker-alpha" / "src"
+# shinestacker supplies the alpha-aware focus stacker (PyramidAutoStack).
+# It is a normal installed dependency:  pip install "shinestacker>=1.17.0"
+#
+# 1.17.0 is the first release that carries an alpha channel through the
+# Laplacian pyramid. Older versions still stack, but silently discard the
+# matte — which looks like a MattePro bug rather than a version problem, so
+# the version is checked up front and reported in the UI.
+SHINESTACKER_MIN = "1.17.0"
+
+
+def _ver_tuple(s):
+    """Parse '1.17.0' / '1.17.0rc1' into a comparable 3-tuple."""
+    out = []
+    for part in str(s).split(".")[:3]:
+        digits = ""
+        for ch in part:
+            if not ch.isdigit():
+                break
+            digits += ch
+        out.append(int(digits or 0))
+    while len(out) < 3:
+        out.append(0)
+    return tuple(out)
+
+
+def _shinestacker_status():
+    """(available, version, problem) — never imports shinestacker.
+
+    Importing it pulls in scipy and matplotlib, which is slow enough to be
+    visible at startup, so availability is probed via the module finder.
+    find_spec works inside a PyInstaller bundle; dist metadata may not be
+    present there, so a missing version is treated as "bundled and fine"
+    rather than as an error.
+    """
+    import importlib.util
+    import importlib.metadata as _md
+    if importlib.util.find_spec("shinestacker") is None:
+        return False, None, ("shinestacker is not installed — "
+                             f"pip install \"shinestacker>={SHINESTACKER_MIN}\"")
+    try:
+        v = _md.version("shinestacker")
+    except Exception:
+        return True, None, None
+    if _ver_tuple(v) < _ver_tuple(SHINESTACKER_MIN):
+        return False, v, (f"shinestacker {v} is installed, but {SHINESTACKER_MIN} or "
+                          "newer is required to carry alpha through the stack")
+    return True, v, None
 
 # ── Kelvin → linear-light RGB ─────────────────────────────────────────────────
 
@@ -749,8 +795,6 @@ class StackPipeline:
 
     def run(self):
         try:
-            if str(SHINESTACKER_SRC) not in sys.path:
-                sys.path.insert(0, str(SHINESTACKER_SRC))
             from shinestacker import PyramidAutoStack
             n=len(self._dirs)
             n_ok=0; n_fail=0
@@ -2798,16 +2842,17 @@ def _build_stack_panel():
         # 1. FOCUS STACKING
         with ui.element("div").classes("card"):
             _section("1.  FOCUS STACKING")
-            ui.html('<p class="status-muted" style="margin-bottom:12px">shinestacker PyramidAutoStack (alpha-aware).<br>Output → stacked/ alongside matte/.</p>')
+            ss_avail, ss_ver, ss_problem = _shinestacker_status()
+            _ss_label = f"shinestacker {ss_ver}" if ss_ver else "shinestacker"
+            ui.html(f'<p class="status-muted" style="margin-bottom:12px">{_ss_label} PyramidAutoStack (alpha-aware).<br>Output → stacked/ alongside matte/.</p>')
             ui.html('<span id="matte-status" class="status-muted" style="display:block;margin-bottom:12px">No matte/ folders found</span>')
-            ss_avail = SHINESTACKER_SRC.exists()
             cls = "mp-btn-primary" if ss_avail else "mp-btn-secondary"
             dis = "" if ss_avail else "disabled"
             stack_html = ui.html(f'<button class="{cls}" {dis} id="stack-run-btn">⊞  STACK MATTES</button>')
             stack_html.on("click", state.start_stacking)
             state.ui["stack_btn"] = stack_html
             if not ss_avail:
-                ui.html(f'<p class="status-err" style="margin-top:8px">shinestacker not found at<br>{SHINESTACKER_SRC}</p>')
+                ui.html(f'<p class="status-err" style="margin-top:8px">{ss_problem}</p>')
             ui.element("div").style("height:8px")
             stack_cancel = ui.html('<button class="mp-btn-secondary" id="stack-cancel-btn" disabled>■  CANCEL</button>')
             stack_cancel.on("click", state.cancel)
