@@ -671,7 +671,8 @@ class _SSProcess:
 class StackPipeline:
     def __init__(self, matte_dirs, on_progress=None, on_log=None, on_done=None, on_preview=None,
                  denoise=0, sharpen=0, sharpen_radius=1.0, kernel_size=5, gen_kernel=0.4, min_size=32,
-                 alpha_lut=None, halo_fix=True, halo_pct=75, align=True):
+                 alpha_lut=None, halo_fix=True, halo_pct=75, align=True,
+                 defocus_filter=True, defocus_keep=0.15):
         self._dirs=matte_dirs; self._on_prog=on_progress or (lambda n,t:None)
         self._on_log=on_log or (lambda m:None); self._on_done=on_done or (lambda ok,m:None)
         self._on_prev=on_preview or (lambda imgs:None)
@@ -681,8 +682,110 @@ class StackPipeline:
         self._halo_fix=halo_fix
         self._halo_pct=int(halo_pct)
         self._align=align
+        self._defocus_filter=bool(defocus_filter)
+        self._defocus_keep=float(defocus_keep)
         self._alpha_stack=None
         self._cancelled=False
+
+    # ── Defocused-frame rejection ────────────────────────────────────────────
+    _FOCUS_WIN  = 15       # px; local sharpness window — small, to catch a wing tip
+    _FOCUS_TOPN = 40       # average this many best pixels, so one hot pixel cannot win
+
+    def _focus_score(self, path):
+        """Sharpness of the SHARPEST SMALL PATCH inside the subject.
+
+        The question is not "is this frame sharp" but "does this frame contain
+        any real detail worth fusing". A stack frame typically starts with just
+        the tip of a wing or a leg in focus and everything else soft — that
+        frame is valuable, and any statistic that averages over the subject
+        throws it away.
+
+        So: local sharpness energy over a small window, then the mean of the
+        highest-responding pixels. A tiny in-focus tip lights up its own window
+        and survives; a frame whose focus plane missed the specimen entirely has
+        no window anywhere above the noise floor.
+
+        Scored INSIDE THE MATTE ONLY. These frames are RGBA with a transparent
+        background, so a whole-frame measure is dominated by the cutout edge — a
+        hard step from subject to nothing — and every frame scores high whatever
+        its focus. The alpha mask is eroded so that edge is excluded too.
+
+        Returns a raw score; the keep/drop decision is relative to the rest of
+        the stack (see _filter_defocused), because absolute sharpness depends on
+        subject, magnification and lighting.
+        """
+        try:
+            import cv2
+            arr = tifffile.imread(str(path))
+        except Exception:
+            return None
+        if arr is None or arr.ndim != 3 or arr.shape[2] < 3:
+            return None
+        a  = arr.astype(np.float32)
+        mx = 65535.0 if arr.dtype == np.uint16 else 255.0
+        rgb = a[:, :, :3] / mx
+        lum = (0.2126*rgb[:, :, 0] + 0.7152*rgb[:, :, 1] + 0.0722*rgb[:, :, 2])
+
+        if arr.shape[2] >= 4:
+            alpha = a[:, :, 3] / mx
+            mask  = (alpha > 0.9).astype(np.uint8)
+            mask  = cv2.erode(mask, np.ones((9, 9), np.uint8), iterations=2)
+        else:
+            mask = np.ones(lum.shape, np.uint8)
+        if int(mask.sum()) < 256:
+            return 0.0          # nothing opaque enough to judge
+
+        # Local sharpness energy: Laplacian squared, averaged over a small
+        # window. The window smooths away single-pixel noise spikes without
+        # diluting a genuinely sharp edge.
+        lap = cv2.Laplacian(lum, cv2.CV_32F, ksize=3)
+        eng = cv2.boxFilter(lap * lap, -1, (self._FOCUS_WIN, self._FOCUS_WIN),
+                            normalize=True)
+
+        # Only consider windows fully inside the subject.
+        inner = cv2.erode(mask, np.ones((self._FOCUS_WIN, self._FOCUS_WIN), np.uint8))
+        vals  = eng[inner > 0]
+        if vals.size == 0:
+            return 0.0
+
+        n = min(self._FOCUS_TOPN, vals.size)
+        return float(np.mean(np.partition(vals, -n)[-n:]))
+
+    def _filter_defocused(self, tiffs):
+        """Drop frames with no in-focus region. Returns (kept, dropped, scores).
+
+        The rail travels the same start->end on every rotation, but a specimen
+        is not the same depth from every angle, so some frames land with the
+        focus plane entirely off the subject. Those carry no detail for the
+        fusion to select — only grain, which a Laplacian pyramid is happy to
+        treat as structure.
+
+        The threshold is a fraction of the sharpest frame IN THIS STACK, since
+        absolute sharpness is meaningless across subjects and magnifications.
+        A floor of three frames is always kept: if a whole stack scores flat,
+        the safe reading is that the measure is unreliable here rather than that
+        every frame is worthless.
+        """
+        scores = []
+        for t in tiffs:
+            if self._cancelled:
+                return list(tiffs), [], []
+            scores.append(self._focus_score(t))
+
+        valid = [s for s in scores if s is not None and s > 0]
+        if len(valid) < 3:
+            return list(tiffs), [], scores
+
+        peak = max(valid)
+        thr  = peak * self._defocus_keep
+        keep, drop = [], []
+        for t, s in zip(tiffs, scores):
+            (keep if (s is None or s >= thr) else drop).append(t)
+
+        MIN_KEEP = 3
+        if len(keep) < MIN_KEEP:
+            return list(tiffs), [], scores
+        return keep, drop, scores
 
     _ALIGN_DS = 4      # match features at 1/4 res; the transform scales back up
 
@@ -804,6 +907,24 @@ class StackPipeline:
                 self._on_prog(i,n)
                 tiffs=sorted(t for t in d.glob("*.tif*") if not t.name.startswith("."))
                 if not tiffs: self._on_log("  No TIFFs — skip"); continue
+
+                if self._defocus_filter and len(tiffs) >= 6:
+                    self._on_log("  scoring focus…")
+                    _kept, _dropped, _scores = self._filter_defocused(tiffs)
+                    if _dropped:
+                        _sv = [x for x in _scores if x]
+                        self._on_log(
+                            f"  dropped {len(_dropped)} defocused frame(s) "
+                            f"(peak {max(_sv):.4g}, threshold "
+                            f"{max(_sv)*self._defocus_keep:.4g})")
+                        for _d in _dropped[:8]:
+                            self._on_log(f"    – {_d.name}")
+                        if len(_dropped) > 8:
+                            self._on_log(f"    … and {len(_dropped)-8} more")
+                        tiffs = _kept
+                    else:
+                        self._on_log("  all frames carry in-focus detail")
+
                 self._on_log(f"  {len(tiffs)} frame(s) to fuse")
                 # Sub-progress within this directory, so a single long stack does
                 # not leave the bar pinned at 0%.
