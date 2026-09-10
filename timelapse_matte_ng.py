@@ -2683,6 +2683,9 @@ class MatteApp:
                     self._js_status("cal-status", cal_txt, "status-ok" if active else "status-muted")
                     # Re-run preview now that cal is available (first preview ran without it)
                     self.request_preview_refresh()
+                elif k == "cal_progress":
+                    self._append_log(item[1])
+                    self._js_status("cal-status", item[1].strip(), "status-muted")
                 elif k == "cal_err":
                     self.cal_loading = False
                     self._js_status("cal-status", f"Cal error: {item[1][:50]}", "status-err")
@@ -2697,6 +2700,26 @@ class MatteApp:
                     self.load_cal_images()
         except queue.Empty:
             pass
+        except Exception:
+            # One bad message must not take the whole UI down.
+            #
+            # This only caught queue.Empty, so any other exception escaped
+            # poll() and NiceGUI stopped driving the timer — every later update
+            # was then lost in silence. Observed exactly that: a background
+            # worker finished and returned a calibration, and the status line
+            # still read "No calibration images" because the message announcing
+            # it was never processed. The visible symptom is a button that
+            # appears to do nothing, which is the worst possible presentation of
+            # a working feature.
+            #
+            # The offending message is already dequeued, so it is dropped; the
+            # next tick carries on with the rest.
+            import traceback as _tb
+            try:
+                logging.getLogger(__name__).warning(
+                    "UI poll dropped a message: %s", _tb.format_exc(limit=3))
+            except Exception:
+                pass
 
     _BG_SOLID = {
         "black":   (  0,   0,   0), "kelvin":  (200, 169, 110),
@@ -2805,12 +2828,18 @@ class MatteApp:
         if self.cal_loading:
             return
         self.cal_loading = True
+        # Say so immediately. Reading 30 frames across three slots takes about
+        # 90 seconds, and with the status line left reading "No calibration
+        # images" the whole time the button looks dead — which is how a working
+        # derivation got reported as broken.
+        self._js_status("cal-status", "Deriving calibration… (~90s, reading frames)",
+                        "status-muted")
         self._q.put(("log", "Deriving calibration from captures…"))
         def worker():
             try:
                 cal, msg = derive_calibration(
                     self.pairs, max_frames=30,
-                    on_log=lambda m: self._q.put(("log", m)),
+                    on_log=lambda m: self._q.put(("cal_progress", m)),
                     should_run=lambda: True)
                 if cal is None:
                     self._q.put(("log", f"Derive calibration failed: {msg}"))
