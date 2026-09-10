@@ -672,7 +672,8 @@ class StackPipeline:
     def __init__(self, matte_dirs, on_progress=None, on_log=None, on_done=None, on_preview=None,
                  denoise=0, sharpen=0, sharpen_radius=1.0, kernel_size=5, gen_kernel=0.4, min_size=32,
                  alpha_lut=None, halo_fix=True, halo_pct=75, align=True,
-                 defocus_filter=True, defocus_keep=0.15):
+                 defocus_filter=True, defocus_keep=0.15,
+                 defocus_scan="ends"):
         self._dirs=matte_dirs; self._on_prog=on_progress or (lambda n,t:None)
         self._on_log=on_log or (lambda m:None); self._on_done=on_done or (lambda ok,m:None)
         self._on_prev=on_preview or (lambda imgs:None)
@@ -684,6 +685,7 @@ class StackPipeline:
         self._align=align
         self._defocus_filter=bool(defocus_filter)
         self._defocus_keep=float(defocus_keep)
+        self._defocus_scan=str(defocus_scan)
         self._alpha_stack=None
         self._cancelled=False
 
@@ -760,30 +762,85 @@ class StackPipeline:
         fusion to select — only grain, which a Laplacian pyramid is happy to
         treat as structure.
 
-        The threshold is a fraction of the sharpest frame IN THIS STACK, since
-        absolute sharpness is meaningless across subjects and magnifications.
-        A floor of three frames is always kept: if a whole stack scores flat,
-        the safe reading is that the measure is unreliable here rather than that
-        every frame is worthless.
-        """
-        scores = []
-        for t in tiffs:
-            if self._cancelled:
-                return list(tiffs), [], []
-            scores.append(self._focus_score(t))
+        Scans INWARD FROM EACH END rather than scoring every frame. The rail
+        sweeps monotonically through the specimen, so the focus plane can only
+        miss it at the extremes: once a frame at the near end shows detail,
+        every frame deeper in does too. Scoring is not cheap — 0.92s on a
+        6000x4000 RGBA frame, which is 69 minutes for a 100-rotation batch at
+        45 frames each — so walking in from the ends and stopping at the first
+        keeper takes that to about 15 minutes.
 
+        Set defocus_scan="all" to score every frame instead. That is the only
+        way to catch a bad frame in the MIDDLE of a stack (a matting failure, a
+        subject that shifted), which the ends-inward walk assumes cannot happen.
+
+        The threshold is a fraction of the sharpest frame seen, since absolute
+        sharpness is meaningless across subjects and magnifications. A floor of
+        three frames is always kept: a stack that scores flat means the measure
+        is unreliable there, not that every frame is worthless.
+        """
+        n = len(tiffs)
+        scores = [None] * n
+
+        def score(i):
+            if scores[i] is None:
+                scores[i] = self._focus_score(tiffs[i])
+            return scores[i] or 0.0
+
+        # ── Reference peak ────────────────────────────────────────────────────
+        # Probe the middle, where the focus plane is inside the specimen by
+        # assumption, to learn what "sharp" is worth for this stack.
+        if getattr(self, "_defocus_scan", "ends") == "ends" and n >= 8:
+            probes = sorted({n // 2, n // 3, (2 * n) // 3})
+            peak = max(score(i) for i in probes)
+            if peak <= 0.0:
+                # Middle looks flat — the assumption does not hold here, so fall
+                # back to scoring everything rather than guessing.
+                for i in range(n):
+                    score(i)
+                return self._decide(tiffs, scores)
+
+            thr = peak * self._defocus_keep
+            # Never eat more than this much of the stack from one end; beyond it
+            # something other than defocus is going on.
+            limit = max(1, int(n * 0.4))
+
+            lead = 0
+            while lead < limit and score(lead) < thr:
+                lead += 1
+            tail = 0
+            while tail < limit and score(n - 1 - tail) < thr:
+                tail += 1
+
+            if lead >= limit or tail >= limit:
+                self._on_log("  focus scan inconclusive from the ends — "
+                             "scoring every frame")
+                for i in range(n):
+                    score(i)
+                return self._decide(tiffs, scores)
+
+            drop = [tiffs[i] for i in range(lead)] + \
+                   [tiffs[n - 1 - i] for i in range(tail)]
+            keep = [t for t in tiffs if t not in drop]
+            if len(keep) < 3:
+                return list(tiffs), [], scores
+            return keep, drop, scores
+
+        # ── Exhaustive ────────────────────────────────────────────────────────
+        for i in range(n):
+            score(i)
+        return self._decide(tiffs, scores)
+
+    def _decide(self, tiffs, scores):
+        """Keep/drop from a fully-scored stack, threshold relative to its peak."""
         valid = [s for s in scores if s is not None and s > 0]
         if len(valid) < 3:
             return list(tiffs), [], scores
-
-        peak = max(valid)
-        thr  = peak * self._defocus_keep
+        thr = max(valid) * self._defocus_keep
         keep, drop = [], []
         for t, s in zip(tiffs, scores):
             (keep if (s is None or s >= thr) else drop).append(t)
-
-        MIN_KEEP = 3
-        if len(keep) < MIN_KEEP:
+        if len(keep) < 3:
             return list(tiffs), [], scores
         return keep, drop, scores
 
