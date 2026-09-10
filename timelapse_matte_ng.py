@@ -7,6 +7,7 @@ import asyncio
 import base64
 import gc
 import io
+import json
 import logging
 import os
 import queue
@@ -130,6 +131,54 @@ def _frame_key(p):
     m = re.search(r"rot[+\-]?\d+\.\d+", p.as_posix(), re.IGNORECASE)
     return m.group(0).lower() if m else p.parent.name
 
+# Rotation applied when decoding RAWs, as a LibRaw user_flip code. -1 means
+# "whatever the camera wrote into the file", which is rawpy's default and was
+# the only behaviour before PiSlider started recording the operator's choice.
+#
+# Verified against a real ARW from this rig:
+#     0 = unrotated   3 = 180   5 = 90 CCW   6 = 90 CW
+# and -1 resolved to 5, so every scan was silently taking a 90 CCW rotation
+# from the camera's accelerometer.
+_CAPTURE_FLIP = -1
+
+_ORIENT_TO_FLIP = {
+    "landscape":    0,
+    "portrait_cw":  6,
+    "portrait_ccw": 5,
+    "inverted":     3,
+}
+
+
+def set_capture_orientation(proj: Path, on_log=None) -> str:
+    """Adopt the orientation PiSlider recorded for this capture, if it did.
+
+    Set once per project rather than passed to every read: it is a property of
+    the capture session, and the fifteen call sites include the calibration
+    frames, which must decode the same way round as the captures or the
+    triangulation subtracts a rotated background.
+
+    Falls back to the camera's own flag when there is no project.json, so
+    hand-assembled projects and older scans behave exactly as before.
+    """
+    global _CAPTURE_FLIP
+    orient = None
+    try:
+        for pj in sorted(Path(proj).glob("**/project.json"))[:8]:
+            with open(pj) as fh:
+                o = json.load(fh).get("camera_orientation")
+            if o:
+                orient = o
+                break
+    except Exception:
+        pass
+    _CAPTURE_FLIP = _ORIENT_TO_FLIP.get(orient, -1)
+    msg = (f"Capture orientation: {orient} (user_flip={_CAPTURE_FLIP})" if orient
+           else "Capture orientation: not recorded — using the camera's own flag")
+    if on_log:
+        on_log(msg)
+    return msg
+
+
 def _read_raw_linear(path, half_size=False, ca_scale=(1.0, 1.0)):
     """Return scene-linear [0,1] float32 RGB. rawpy gamma=(1,1) = linear output; no gamma decode needed."""
     with rawpy.imread(str(path)) as raw:
@@ -141,6 +190,7 @@ def _read_raw_linear(path, half_size=False, ca_scale=(1.0, 1.0)):
             gamma=(1, 1),
             bright=1.0,
             half_size=half_size,
+            user_flip=_CAPTURE_FLIP,
         )
     arr = rgb.astype(np.float32) / 65535.0
     if ca_scale != (1.0, 1.0):
@@ -2548,6 +2598,9 @@ class MatteApp:
 
         def _scan():
             try:
+                # Before anything decodes a RAW: adopt the orientation the
+                # capture recorded, so captures and calibration frames agree.
+                self._q.put(("log", set_capture_orientation(proj)))
                 pairs, matte_dirs, stacked, cal_paths = _scan_project(proj)
                 self._q.put(("project_scanned", pairs, matte_dirs, stacked, proj, cal_paths))
             except Exception as exc:
