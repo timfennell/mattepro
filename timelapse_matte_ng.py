@@ -95,6 +95,30 @@ def kelvin_to_linear(k):
     def srgb_inv(v): return (v / 255.0 / 12.92) if v/255.0 <= 0.04045 else ((v/255.0 + 0.055) / 1.055) ** 2.4
     return np.array([srgb_inv(r), srgb_inv(g), srgb_inv(b)], dtype=np.float32)
 
+_STACK_DIR_RE = re.compile(r"^stack[_-]?(\d+)$", re.I)
+
+
+def colmap_image_name(rot_dir: Path) -> str:
+    """Filename for a rotation's COLMAP image, ordered by capture.
+
+    The rotation folder is named by ANGLE (rot+070.351_aux-071.25), so a
+    directory listing sorts by pan angle and the capture sequence is scrambled.
+    That is only cosmetic under exhaustive matching, but it is not cosmetic for
+    sequential or vocab-tree matching, where COLMAP infers which images are
+    adjacent from filename order — a scrambled sequence there pairs views that
+    have nothing in common and skips the ones that overlap.
+
+    The capture index is already on disk as the parent folder (stack_007), so
+    prefixing it zero-padded makes lexical order equal capture order while
+    keeping the angles legible. Falls back to the bare angle name for layouts
+    that do not use stack_NNN parents.
+    """
+    m = _STACK_DIR_RE.match(rot_dir.parent.name)
+    if m:
+        return f"{int(m.group(1)):04d}_{rot_dir.name}.png"
+    return f"{rot_dir.name}.png"
+
+
 @dataclass
 class MattePair:
     black: Path
@@ -1506,7 +1530,7 @@ class BatchPipeline:
         rot=mdir.parent
         return dict(i=i, pairs=gp, mdir=mdir, rot=rot,
                     out=rot/"stacked"/f"{rot.name}_stacked.tif",
-                    img=self._proj/"colmap_images"/f"{rot.name}.png")
+                    img=self._proj/"colmap_images"/colmap_image_name(rot))
 
     @staticmethod
     def _purge(paths):
@@ -2738,7 +2762,7 @@ class MatteApp:
                             if not grp: continue
                             rd=pairs[grp[0]].out_path.parent.parent
                             sp=rd/"stacked"/f"{rd.name}_stacked.tif"
-                            ip=Path(proj)/"colmap_images"/f"{rd.name}.png"
+                            ip=Path(proj)/"colmap_images"/colmap_image_name(rd)
                             if not (sp.exists() and ip.exists()): todo+=1
                         rc=len(self._stacks)
                         if not rc:
