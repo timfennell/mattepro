@@ -11,6 +11,7 @@ import logging
 import os
 import queue
 import re
+import math
 import sys
 import threading
 import time
@@ -510,6 +511,162 @@ def compute_preview(cb, cw, cg, bg_white, alpha_min, cal, grey_brightness, alpha
             "composite": comp,
             "fg8": fg8,          # sharpened gamma-encoded foreground for compositing
             "fg_lin": fg_disp, "alpha_raw": alpha}
+
+def derive_calibration(pairs, max_frames=30, on_log=None, should_run=None):
+    """Reconstruct calibration frames from the captures themselves.
+
+    A calibration shot is an empty frame: it records what the background looks
+    like with no specimen — lens vignetting, phone-screen falloff, the sensor
+    noise floor. Without one the solve falls back to a flat constant for white
+    and exact zero for black, so
+
+        raw_alpha = 1 - (cw - cb) / (cal_w - cal_b)
+
+    lands slightly under 1 across the background instead of exactly 1. That is
+    the faint haze that no amount of raising the opacity floor removes cleanly,
+    because the floor hides the error rather than correcting it, and lifting it
+    far enough eats the soft edges — antennae, wing margins — that the matte
+    exists to preserve.
+
+    A synthetic flat image cannot help: it is arithmetically identical to the
+    fallback. But the real background IS recoverable from the captures, because
+    the specimen occupies a small part of the frame and ROTATES. Sample frames
+    spread across rotations and any given background pixel is unobstructed in
+    most of them, so a per-pixel median rejects the specimen as an outlier and
+    leaves the true background.
+
+    Frames are sampled across rotations rather than within one, so the subject
+    lands somewhere different in each. Half-size is deliberate: it matches what
+    compute_preview solves at, and keeps a 30-frame stack near 1 GB instead of
+    tens.
+    """
+    log = on_log or (lambda m: None)
+    alive = should_run or (lambda: True)
+    if not pairs:
+        return None, "no pairs to derive from"
+
+    # Spread the sample across rotations. Consecutive frames in one rotation
+    # differ only by focus, so the subject sits in the same place and the
+    # median would keep it.
+    by_rot = {}
+    for pr in pairs:
+        by_rot.setdefault(_frame_key(pr.black), []).append(pr)
+    rots = sorted(by_rot)
+    if len(rots) < 3:
+        return None, (f"only {len(rots)} rotation(s) found — the subject barely moves "
+                      "between them, so a median cannot separate it from the background")
+
+    picks = []
+    r = 0
+    while len(picks) < max_frames and r < max_frames * 3:
+        rot = rots[r % len(rots)]
+        grp = by_rot[rot]
+        idx = (r // len(rots))
+        if idx < len(grp):
+            picks.append(grp[idx])
+        r += 1
+    if len(picks) < 5:
+        return None, f"only {len(picks)} usable frames"
+
+    def _stack_background(get_path, label, bright_bg):
+        """Recover the background plane for one slot.
+
+        Two stages, and the second is not optional.
+
+        Per-pixel PERCENTILE across frames, not median. The specimen is pinned
+        at frame centre and rotates in place — it does not translate — so the
+        central pixels are covered in most frames and a median returns the
+        specimen there. A high percentile on a white background (the specimen is
+        darker) or a low percentile on black (the specimen is brighter) survives
+        the specimen covering a pixel in most, though not all, frames.
+
+        Then FIT A SMOOTH SURFACE and use the fit everywhere. Whatever the
+        percentile does, pixels the specimen never uncovers cannot be measured
+        at all, and using a measured value there would make the specimen itself
+        transparent. Vignetting and screen falloff are low-frequency, so a
+        quadratic in x and y is a good model: it is fitted on the periphery,
+        where the background genuinely is visible, and evaluated across the
+        middle. That also smooths away sensor noise, which is the other thing a
+        calibration frame should not carry.
+        """
+        frames, chroma = [], []
+        for i, pr in enumerate(picks):
+            if not alive():
+                return None
+            path = get_path(pr)
+            if path is None or not Path(path).exists():
+                continue
+            try:
+                a = _read_raw_linear(Path(path), half_size=True)
+            except Exception as e:
+                log(f"    skip {Path(path).name}: {e}")
+                continue
+            frames.append((a * 65535.0).clip(0, 65535).astype(np.uint16))
+            m = a.reshape(-1, 3).mean(axis=0)
+            chroma.append(float(m[0] / max(m[2], 1e-6)))
+            if (i + 1) % 5 == 0:
+                log(f"    {label}: read {len(frames)}/{len(picks)}")
+        if len(frames) < 5:
+            return None
+
+        # Drop frames whose background colour disagrees with the rest. A screen
+        # that drifted partway through a scan would otherwise poison every
+        # frame after it.
+        med_c = float(np.median(chroma))
+        keep = [f for f, c in zip(frames, chroma)
+                if med_c > 0 and abs(math.log2(max(c, 1e-6) / med_c)) <= 0.15]
+        if 5 <= len(keep) < len(frames):
+            log(f"    {label}: dropped {len(frames)-len(keep)} frame(s) whose background "
+                f"colour disagreed (drifted screen?)")
+            frames = keep
+
+        stack = np.stack(frames, axis=0)
+        h, w = stack.shape[1], stack.shape[2]
+        pct = 90.0 if bright_bg else 10.0
+        meas = np.empty(stack.shape[1:], np.float32)
+        band = max(64, h // 12)
+        for y in range(0, h, band):
+            meas[y:y+band] = np.percentile(stack[:, y:y+band], pct, axis=0).astype(np.float32)
+        del stack
+        meas /= 65535.0
+
+        # Fit a quadratic surface per channel on the periphery, where the
+        # background is actually visible, then evaluate it everywhere.
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        nx = (xx / max(w - 1, 1)) * 2.0 - 1.0
+        ny = (yy / max(h - 1, 1)) * 2.0 - 1.0
+        edge = (np.abs(nx) > 0.55) | (np.abs(ny) > 0.55)       # outer frame only
+        A_all = np.stack([np.ones_like(nx), nx, ny, nx*nx, ny*ny, nx*ny], axis=-1)
+        A_fit = A_all[edge]
+        out = np.empty_like(meas)
+        for c in range(3):
+            coef, *_ = np.linalg.lstsq(A_fit, meas[edge][:, c], rcond=None)
+            out[:, :, c] = A_all @ coef
+        resid = float(np.abs((A_all[edge] @ np.linalg.lstsq(
+            A_fit, meas[edge][:, 1], rcond=None)[0]) - meas[edge][:, 1]).mean())
+        log(f"    {label}: fitted background surface, edge residual {resid:.5f}")
+        return np.clip(out, 0.0, 1.0)
+
+    log(f"  deriving calibration from {len(picks)} frames across {len(rots)} rotations…")
+    cal = CalImages()
+    w = _stack_background(lambda pr: pr.white, "white", bright_bg=True)
+    if w is None:
+        return None, "could not read enough white frames"
+    b = _stack_background(lambda pr: pr.black, "black", bright_bg=False)
+    if b is None:
+        return None, "could not read enough black frames"
+    g = (_stack_background(lambda pr: pr.grey, "grey", bright_bg=True)
+         if any(pr.grey for pr in picks) else None)
+
+    cal.white_half, cal.black_half = w, b
+    if g is not None:
+        cal.grey_half = g
+    # full-size variants are only used for export; the half-size pair is what
+    # the solve consumes, so leave *_full unset rather than fabricate them.
+    rng = float(np.mean(w) - np.mean(b))
+    return cal, (f"derived from {len(picks)} frames · mean white {np.mean(w):.4f}, "
+                 f"black {np.mean(b):.4f}, separation {rng:.4f}")
+
 
 class MattePipeline:
     def __init__(self, pairs, bg_white, alpha_min, cal=None, grey_brightness=50,
@@ -2606,6 +2763,33 @@ class MatteApp:
             import traceback
             self._q.put(("log", "DISPLAY ERR: " + traceback.format_exc()))
 
+    def derive_cal(self):
+        """Reconstruct calibration from the captures when no cal shots exist."""
+        if not self.pairs:
+            self._q.put(("log", "Derive calibration: load a project folder first."))
+            return
+        if self.cal_loading:
+            return
+        self.cal_loading = True
+        self._q.put(("log", "Deriving calibration from captures…"))
+        def worker():
+            try:
+                cal, msg = derive_calibration(
+                    self.pairs, max_frames=30,
+                    on_log=lambda m: self._q.put(("log", m)),
+                    should_run=lambda: True)
+                if cal is None:
+                    self._q.put(("log", f"Derive calibration failed: {msg}"))
+                    self.cal_loading = False
+                    return
+                self._q.put(("log", f"Calibration derived — {msg}"))
+                self._q.put(("cal_loaded", cal))
+            except Exception as e:
+                self._q.put(("cal_err", str(e)))
+            finally:
+                self.cal_loading = False
+        threading.Thread(target=worker, daemon=True).start()
+
     def load_cal_images(self):
         if self.cal_loading: return
         paths = [self.cal_black_path, self.cal_white_path, self.cal_grey_path]
@@ -2781,6 +2965,18 @@ def _build_matte_panel():
             _file_row("White cal", "cal_white_path")
             _file_row("Grey cal",  "cal_grey_path")
             ui.html('<span id="cal-status" class="status-muted">No calibration images</span>')
+            ui.element("div").style("height:8px")
+            derive_btn = ui.html(
+                '<button class="mp-btn-secondary" id="derive-cal-btn" '
+                'title="Reconstruct the background from the captures themselves: '
+                'sample frames across rotations, take a percentile so the specimen '
+                'is rejected where it moves, then fit a smooth surface through the '
+                'region it always covers.">&#9881;&nbsp; DERIVE FROM CAPTURES</button>')
+            derive_btn.on("click", state.derive_cal)
+            ui.html('<p class="status-muted" style="margin-top:8px;font-size:11px;line-height:1.5">'
+                    'Use when calibration shots were not taken. Real empty-frame '
+                    'captures are better — this infers the background instead of '
+                    'measuring it.</p>')
 
         # 3. MATTING SETTINGS
         with ui.element("div").classes("card"):
