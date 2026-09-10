@@ -639,30 +639,64 @@ def derive_calibration(pairs, max_frames=30, on_log=None, should_run=None):
         A_all = np.stack([np.ones_like(nx), nx, ny, nx*nx, ny*ny, nx*ny], axis=-1)
         A_fit = A_all[edge]
         out = np.empty_like(meas)
+        coefs = []
         for c in range(3):
             coef, *_ = np.linalg.lstsq(A_fit, meas[edge][:, c], rcond=None)
+            coefs.append(coef)
             out[:, :, c] = A_all @ coef
         resid = float(np.abs((A_all[edge] @ np.linalg.lstsq(
             A_fit, meas[edge][:, 1], rcond=None)[0]) - meas[edge][:, 1]).mean())
         log(f"    {label}: fitted background surface, edge residual {resid:.5f}")
+        return np.clip(out, 0.0, 1.0), coefs
+
+    def _eval_surface(coefs, shape_hw):
+        """Evaluate a fitted background surface at any resolution.
+
+        The fit is a quadratic in normalised coordinates, so the full-size plane
+        is evaluated exactly rather than upsampled from the half-size one.
+        Both are needed: the solve reads *_half, but CalImages.available — which
+        gates whether the solve uses the calibration at all — requires *_full.
+        """
+        h, w = shape_hw
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        nx = (xx / max(w - 1, 1)) * 2.0 - 1.0
+        ny = (yy / max(h - 1, 1)) * 2.0 - 1.0
+        A = np.stack([np.ones_like(nx), nx, ny, nx*nx, ny*ny, nx*ny], axis=-1)
+        out = np.empty((h, w, 3), np.float32)
+        for c in range(3):
+            out[:, :, c] = A @ coefs[c]
         return np.clip(out, 0.0, 1.0)
 
     log(f"  deriving calibration from {len(picks)} frames across {len(rots)} rotations…")
     cal = CalImages()
-    w = _stack_background(lambda pr: pr.white, "white", bright_bg=True)
-    if w is None:
+    rw = _stack_background(lambda pr: pr.white, "white", bright_bg=True)
+    if rw is None:
         return None, "could not read enough white frames"
-    b = _stack_background(lambda pr: pr.black, "black", bright_bg=False)
-    if b is None:
+    rb = _stack_background(lambda pr: pr.black, "black", bright_bg=False)
+    if rb is None:
         return None, "could not read enough black frames"
-    g = (_stack_background(lambda pr: pr.grey, "grey", bright_bg=True)
-         if any(pr.grey for pr in picks) else None)
+    rg = (_stack_background(lambda pr: pr.grey, "grey", bright_bg=True)
+          if any(pr.grey for pr in picks) else None)
+    w, w_coef = rw
+    b, b_coef = rb
+    g, g_coef = (rg if rg is not None else (None, None))
 
     cal.white_half, cal.black_half = w, b
     if g is not None:
         cal.grey_half = g
-    # full-size variants are only used for export; the half-size pair is what
-    # the solve consumes, so leave *_full unset rather than fabricate them.
+
+    # Full-size planes as well. The solve reads *_half, but it is gated behind
+    # CalImages.available, which requires black_full AND white_full — so setting
+    # only the half planes produced a correct calibration that the solve then
+    # ignored entirely, with no visible effect and an empty status line.
+    try:
+        full_hw = _read_raw_linear(picks[0].white, half_size=False).shape[:2]
+        cal.white_full = _eval_surface(w_coef, full_hw)
+        cal.black_full = _eval_surface(b_coef, full_hw)
+        if g_coef is not None:
+            cal.grey_full = _eval_surface(g_coef, full_hw)
+    except Exception as e:
+        log(f"    full-size planes skipped: {e}")
     rng = float(np.mean(w) - np.mean(b))
     return cal, (f"derived from {len(picks)} frames · mean white {np.mean(w):.4f}, "
                  f"black {np.mean(b):.4f}, separation {rng:.4f}")
