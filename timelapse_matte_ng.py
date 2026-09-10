@@ -1634,6 +1634,10 @@ class BatchPipeline:
             r=self._run_pipelined(jobs,n) if self._pipelined else self._run_serial(jobs,n)
             done,skipped,failed=r
             self._on_prog(n,n)
+            # Final, authoritative counters — emitted after the last rotation's
+            # matte deletion, so 'reclaimed' includes it, and after the loop, so
+            # the panel cannot be left showing an in-flight ETA.
+            self._stats(done,skipped,failed,n)
             if self._cancelled:
                 self._on_log("Cancelled."); self._on_done(False,"Cancelled"); return
             msg=f"{done} completed, {skipped} skipped, {failed} failed"
@@ -1665,7 +1669,9 @@ class BatchPipeline:
                 if not job["out"].exists():
                     created=self._matte_one(job,self._sub(k,n,0.00,0.55,"matte",rn))
                     if self._cancelled: break
-                    self._on_stage("matte","",0.0)
+                # Outside the branch: a reused matte/ still has to clear the
+                # lane, or it keeps naming the previous rotation.
+                self._on_stage("matte","",0.0)
                 self._stack_and_export(job,created,
                                        self._sub(k,n,0.55,0.90,"stack",rn),
                                        self._sub(k,n,0.90,0.98,"colmap",rn))
@@ -2260,6 +2266,14 @@ class MatteApp:
         self._colmap_pipe: Optional[ColmapMaskPipeline] = None
         self._q: queue.Queue = queue.Queue()
 
+        # Batch dashboard. The panel is raw HTML driven by JS, so the browser
+        # holds no state the server can replay — these are the server's copy,
+        # so a lost message or a reconnected client can be repainted instead of
+        # leaving the panel stale forever.
+        self._batch_stats: Optional[dict] = None
+        self._batch_lanes: dict = {}           # stage -> (label, frac)
+        self._batch_repaint: bool = False
+
         # Preview state
         self.pair_idx: int = 0
         self._stacks: list = []    # list of [pair_indices] per stack/rotation
@@ -2322,6 +2336,11 @@ class MatteApp:
         if not self.pairs or not self._stacks:
             ui.notify("Load a project folder first.", type="warning"); return
         self._clear_log()
+        # Don't let a finished run's lanes bleed into the next one.
+        self._batch_stats = None
+        self._batch_lanes = {}
+        for _st in ("matte", "stack", "colmap"):
+            self._paint_batch_lane(_st, "", 0.0)
         matte_kw = dict(
             bg_white=kelvin_to_linear(self.kelvin), alpha_min=self.alpha_min,
             cal=self.cal, grey_brightness=self.grey_brightness,
@@ -2408,6 +2427,88 @@ class MatteApp:
             f'(function(){{var e=document.getElementById("{el_id}");'
             f'if(e){{e.textContent="{safe}";e.className="{css_class}";}}}})();'
         )
+
+    # ── batch dashboard painting ───────────────────────────────────────
+    #
+    # Kept separate from the message handlers so the same paint can be replayed
+    # from retained state. Every one of these is idempotent.
+
+    @staticmethod
+    def _hms(x):
+        if x is None: return "—"
+        x = int(x)
+        return (f"{x//3600}:{(x%3600)//60:02d}:{x%60:02d}" if x >= 3600
+                else f"{x//60}:{x%60:02d}")
+
+    @staticmethod
+    def _paint_batch_lane(stage, label, frac):
+        txt = label if label else "—"
+        ui.run_javascript(
+            f'(function(){{'
+            f'var t=document.getElementById("b-{stage}");'
+            f'var f=document.getElementById("b-{stage}-fill");'
+            f'if(t)t.textContent={txt!r};'
+            f'if(f)f.style.width="{frac*100:.1f}%";}})()'
+        )
+
+    def _paint_batch_stats(self, d):
+        _hms = self._hms
+        pct = 100.0*d["finished"]/d["total"] if d["total"] else 0.0
+        ui.run_javascript(
+            f'(function(){{var S=function(i,v){{var e=document.getElementById(i);if(e)e.textContent=v;}};'
+            f'S("b-done","{d["done"]}");S("b-skip","{d["skipped"]}");S("b-fail","{d["failed"]}");'
+            f'S("b-elapsed","{_hms(d["elapsed"])}");S("b-eta","{_hms(d["eta"])}");'
+            f'S("b-freed","{d["freed"]/1e9:.1f} GB");'
+            f'S("b-overall","{d["finished"]} / {d["total"]} rotations");'
+            f'var f=document.getElementById("b-overall-fill");'
+            f'if(f)f.style.width="{pct:.1f}%";}})()'
+        )
+
+    def _finish_batch_dashboard(self):
+        """Settle the panel on the terminal state when a run ends.
+
+        Nothing used to do this: the panel only ever showed whatever the last
+        stats message happened to say, so the bars sat wherever they were when
+        the final message was emitted — or lost. The run's own last emission is
+        authoritative for the counts; what needs forcing is that the overall bar
+        reads full when every rotation is accounted for, and that the per-stage
+        lanes stop advertising a rotation that is no longer being worked on.
+        """
+        d = self._batch_stats
+        if d is None:
+            return
+        # Settle all the state first, paint second. Interleaving them means the
+        # first paint that raises leaves the remaining lanes still remembering a
+        # rotation that finished — which is the bug, one level down.
+        for stage in ("matte", "stack", "colmap"):
+            self._batch_lanes[stage] = ("", 0.0)
+        if d.get("total") and d["finished"] >= d["total"]:
+            self._batch_stats = dict(d, eta=None)
+        self._batch_repaint = True
+        self._reconcile_batch_dashboard()
+
+    def _reconcile_batch_dashboard(self):
+        """Repaint the panel after a dropped message, and on a fresh client.
+
+        The dashboard lives in a `ui.html` block and is written only through
+        run_javascript, which NiceGUI does not replay — so a single update lost
+        anywhere (a handler that raised, a client that reconnected mid-run) used
+        to strand the panel permanently out of date, with the log pane beside it
+        reading "finished". Cheap enough to run on a flag: it does nothing until
+        something actually goes wrong.
+        """
+        if not self._batch_repaint:
+            return
+        self._batch_repaint = False
+        try:
+            for stage, (label, frac) in list(self._batch_lanes.items()):
+                self._paint_batch_lane(stage, label, frac)
+            if self._batch_stats is not None:
+                self._paint_batch_stats(self._batch_stats)
+        except Exception:
+            # Can't paint right now. Re-arm rather than swallow, so the panel
+            # catches up as soon as the client can take an update again.
+            self._batch_repaint = True
 
     def reload_project(self):
         p = self.proj_path.strip()
@@ -2528,9 +2629,24 @@ class MatteApp:
             ui.notify(msg[:120], type="negative", timeout=8000)
 
     def poll(self):
-        try:
-            while True:
+        """Drain the worker queue, isolating each message.
+
+        Every message gets its own try. The whole drain used to share one, so a
+        message that raised took with it everything already pulled in that tick
+        — the raising message is gone from the queue, unrecoverable. That is how
+        a batch could log "23 completed" while the dashboard stayed frozen on
+        the 22/23 stats emission: one failed apply, one permanently stale panel.
+        A dropped message now costs only itself, and sets the repaint flag so
+        the batch dashboard reconciler restores it within a second.
+        """
+        while True:
+            try:
                 item = self._q.get_nowait()
+            except queue.Empty:
+                return
+            except Exception:
+                return
+            try:
                 k = item[0]
                 if k == "log":
                     self._append_log(item[1])
@@ -2546,32 +2662,17 @@ class MatteApp:
                         if pl: pl.set_text(f"{n:.0f} / {t}  ({pct:.0f}%)")
                 elif k == "batch_stage":
                     _, stage, label, frac = item
-                    txt = label if label else "—"
-                    ui.run_javascript(
-                        f'(function(){{'
-                        f'var t=document.getElementById("b-{stage}");'
-                        f'var f=document.getElementById("b-{stage}-fill");'
-                        f'if(t)t.textContent={txt!r};'
-                        f'if(f)f.style.width="{frac*100:.1f}%";}})()'
-                    )
+                    # Record before painting: if the paint raises, the
+                    # reconciler still knows what the lane should read.
+                    self._batch_lanes[stage] = (label, frac)
+                    self._paint_batch_lane(stage, label, frac)
                 elif k == "batch_stats":
-                    d = item[1]
-                    def _hms(x):
-                        if x is None: return "—"
-                        x=int(x); return f"{x//3600}:{(x%3600)//60:02d}:{x%60:02d}" if x>=3600 else f"{x//60}:{x%60:02d}"
-                    pct = 100.0*d["finished"]/d["total"] if d["total"] else 0.0
-                    ui.run_javascript(
-                        f'(function(){{var S=function(i,v){{var e=document.getElementById(i);if(e)e.textContent=v;}};'
-                        f'S("b-done","{d["done"]}");S("b-skip","{d["skipped"]}");S("b-fail","{d["failed"]}");'
-                        f'S("b-elapsed","{_hms(d["elapsed"])}");S("b-eta","{_hms(d["eta"])}");'
-                        f'S("b-freed","{d["freed"]/1e9:.1f} GB");'
-                        f'S("b-overall","{d["finished"]} / {d["total"]} rotations");'
-                        f'var f=document.getElementById("b-overall-fill");'
-                        f'if(f)f.style.width="{pct:.1f}%";}})()'
-                    )
+                    self._batch_stats = item[1]
+                    self._paint_batch_stats(item[1])
                 elif k == "done":
                     _, ok, msg = item
                     self._set_ui_running(False)
+                    self._finish_batch_dashboard()
                     if ok:
                         ui.run_javascript(
                             '["prog-fill","stack-prog-fill"].forEach(function(id){'
@@ -2698,28 +2799,38 @@ class MatteApp:
                             f'var el=document.getElementById("{fid}");if(el)el.value={repr(found)};'
                         )
                     self.load_cal_images()
-        except queue.Empty:
-            pass
-        except Exception:
-            # One bad message must not take the whole UI down.
-            #
-            # This only caught queue.Empty, so any other exception escaped
-            # poll() and NiceGUI stopped driving the timer — every later update
-            # was then lost in silence. Observed exactly that: a background
-            # worker finished and returned a calibration, and the status line
-            # still read "No calibration images" because the message announcing
-            # it was never processed. The visible symptom is a button that
-            # appears to do nothing, which is the worst possible presentation of
-            # a working feature.
-            #
-            # The offending message is already dequeued, so it is dropped; the
-            # next tick carries on with the rest.
-            import traceback as _tb
-            try:
-                logging.getLogger(__name__).warning(
-                    "UI poll dropped a message: %s", _tb.format_exc(limit=3))
-            except Exception:
-                pass
+            except Exception as e:
+                # One bad message must not take the whole UI down.
+                #
+                # The original code caught only queue.Empty, so any other
+                # exception escaped poll() and NiceGUI stopped driving the timer
+                # — every later update was then lost in silence. Observed
+                # exactly that: a background worker finished and returned a
+                # calibration, and the status line still read "No calibration
+                # images" because the message announcing it was never processed.
+                # The visible symptom is a button that appears to do nothing,
+                # which is the worst possible presentation of a working feature.
+                #
+                # The offending message is already dequeued, so it is dropped —
+                # but the loop continues, so the messages behind it still land.
+                import traceback as _tb
+                self._batch_repaint = True
+                try:
+                    logging.getLogger(__name__).warning(
+                        "UI poll dropped a %r message: %s",
+                        item[0], _tb.format_exc(limit=4))
+                except Exception:
+                    pass
+                # Say so in the log pane too. A silently dropped update is how
+                # this class of bug stays invisible for months — the run looks
+                # finished in one panel and unfinished in the next, with nothing
+                # anywhere saying why.
+                try:
+                    self._append_log(
+                        f"UI WARN: dropped a {item[0]!r} update "
+                        f"({type(e).__name__}: {e})".replace("\n", " ")[:200])
+                except Exception:
+                    pass
 
     _BG_SOLID = {
         "black":   (  0,   0,   0), "kelvin":  (200, 169, 110),
@@ -3741,6 +3852,12 @@ async def main():
         _build_preview_panel()
 
     ui.timer(0.08, state.poll)
+
+    # Self-heal the batch dashboard. Flagged, so this is a no-op unless a paint
+    # was lost — and flagged on load, so a page opened (or reconnected) during a
+    # running batch picks up the live numbers instead of reading "not started".
+    state._batch_repaint = True
+    ui.timer(1.0, state._reconcile_batch_dashboard)
 
     # ── Sync browser-cached field values back to server state on page load ──
     # Chrome caches form values between app restarts; the server state starts
